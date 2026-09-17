@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="PdfRagQa.Api/PdfRagQa.Api.csproj" />
+  <Project Path="PdfRagQa.Application/PdfRagQa.Application.csproj" />
+  <Project Path="PdfRagQa.Domain/PdfRagQa.Domain.csproj" />
+  <Project Path="PdfRagQa.Infrastructure/PdfRagQa.Infrastructure.csproj" />
+</Solution>

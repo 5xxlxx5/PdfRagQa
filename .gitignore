@@ -1,0 +1,21 @@
+# .NET 构建产物
+**/bin/
+**/obj/
+*.user
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# 运行配置与本地环境
+appsettings.Development.json
+*.local.json
+.env
+
+# 日志与临时文件
+*.log
+logs/
+temp/
+Thumbs.db
+.DS_Store
