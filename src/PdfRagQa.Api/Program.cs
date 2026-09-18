@@ -1,5 +1,6 @@
 using PdfRagQa.Infrastructure;
 using PdfRagQa.Infrastructure.Data;
+using Swashbuckle.AspNetCore.SwaggerUI;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -14,6 +15,16 @@ var app = builder.Build();
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
+
+    // 交互式接口文档。
+    // 本项目是纯 REST API，没有前端页面——直接访问根路径只会得到 404，
+    // 容易让人误以为服务没起来。Swagger UI 提供一个可以直接发请求的页面。
+    // 仅开发环境启用：生产环境不应暴露接口文档。
+    app.UseSwaggerUI(options =>
+    {
+        options.SwaggerEndpoint("/openapi/v1.json", "PdfRagQa API v1");
+        options.DocumentTitle = "PdfRagQa API";
+    });
 }
 else
 {

@@ -66,19 +66,36 @@ sqllocaldb info       # 应列出 MSSQLLocalDB
 dotnet run --project src/PdfRagQa.Api/PdfRagQa.Api.csproj --launch-profile http
 ```
 
-服务地址 <http://localhost:5286>。
+**本项目是纯 REST API，没有前端页面。** 直接访问 `http://localhost:5286/` 会得到 404，
+这不是服务没起来，而是根路径本来就没有内容。
+
+在浏览器里操作请打开**交互式接口文档**：
+
+```
+http://localhost:5286/swagger
+```
+
+页面上可以逐个接口点开、直接填入参数发起请求——上传文档、提问、检索预览、提交反馈都能在这里试。
 
 首次启动会自动完成：建库 → 建表 → 幂等补齐历史数据 → **校验向量列维度与配置是否一致**。
 维度不一致时会直接拒绝启动并给出重建指引（见下文「更换向量模型」）。
 
+> Swagger UI 与 OpenAPI 文档（`/openapi/v1.json`）**仅在开发环境启用**，生产环境不暴露。
+>
 > **环境变量坑**：`--launch-profile` 会读取 `Properties/launchSettings.json` 里的
 > `ASPNETCORE_ENVIRONMENT=Development`。若**直接运行 DLL**（如部署场景），
 > 必须自己设 `ASPNETCORE_ENVIRONMENT=Development`，否则 `appsettings.Development.json`
-> 不会被加载，表现为「模型未配置」。
+> 不会被加载（表现为「模型未配置」），Swagger UI 也不会启用。
 
 ---
 
 ## 四、使用
+
+> **两种方式**：在 <http://localhost:5286/swagger> 页面上直接操作，或用下面的命令行示例。
+>
+> **注意导入接口接收的是服务器本地文件路径**（`filePath`），不是浏览器上传的文件流。
+> 服务需要能读到该路径——本地开发时填你机器上的绝对路径即可，例如
+> `C:/Users/你/Downloads/manual.pdf`。用正斜杠，避免 JSON 反斜杠转义。
 
 ### 1. 导入文档
 
@@ -211,6 +228,7 @@ Domain           实体 · 端口 · 枚举（零外部依赖）
 
 | 现象 | 原因与处理 |
 | --- | --- |
+| 打开 `http://localhost:5286/` 显示 404 | 正常现象：本项目是纯 REST API，根路径无内容。改开 `/swagger` |
 | 启动报「chunk.embedding 列维度为 X，但配置为 Y」 | 配置与表结构不一致，按提示重建 |
 | 导入后 `warnings` 提示「向量化失败」 | 密钥缺失或额度不足。文本已入库，向量可后补 |
 | 问答返回「【生成模型未配置】」 | `appsettings.Development.json` 未被加载，检查 `ASPNETCORE_ENVIRONMENT` |
