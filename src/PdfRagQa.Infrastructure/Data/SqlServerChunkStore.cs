@@ -1,17 +1,23 @@
 using System.Data.Common;
+using System.Text;
 using Dapper;
 using PdfRagQa.Domain;
 using PdfRagQa.Domain.Abstractions;
+using PdfRagQa.Infrastructure.Retrieval;
 
 namespace PdfRagQa.Infrastructure.Data;
 
 /// <summary>
 /// SQL Server 文本/向量存储（Dapper）。
-/// 标量元数据与关键词检索落库；向量检索暂用关键词近似（vector_json 占位，
-/// 后续接入 Milvus/Qdrant 等独立向量库时替换本实现）。
+///
+/// 关键词检索为真实实现：中文 bigram 分词 → 语料统计 → LIKE 粗筛候选 → 内存 BM25 精排。
+/// 向量检索尚未实现（接入 IEmbeddingProvider 后替换），当前返回空集而不是拿关键词结果冒充。
 /// </summary>
 public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
 {
+    /// <summary>粗筛候选上限：兜住「检索词极常见」时结果集过大的情况。</summary>
+    private const int CandidateLimit = 2000;
+
     public async Task UpsertChunkAsync(DocumentChunk chunk, float[] vector, CancellationToken ct = default)
     {
         const string sql = """
@@ -54,32 +60,144 @@ public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
     public async Task<IReadOnlyList<DocumentChunk>> KeywordSearchAsync(
         string query, int topK, string? documentId, string? version, LanguageCode? language, CancellationToken ct = default)
     {
-        // 简单全文近似：分词后按出现次数计分
-        var words = query.Split(new[] { ' ', ',', '，', '。', '；' }, StringSplitOptions.RemoveEmptyEntries);
-        var sql = new System.Text.StringBuilder(
-            "WITH scored AS (SELECT chunk_id FROM dbo.chunk WHERE 1=1 ");
-        if (documentId is not null) sql.Append("AND document_id=@DocumentId ");
-        if (version is not null) sql.Append("AND version=@Version ");
-        if (language is not null && language != LanguageCode.ZhEn) sql.Append("AND [language]=@Lang ");
-        sql.AppendLine(") SELECT TOP (@TopK) c.* FROM dbo.chunk c JOIN scored ON c.chunk_id=scored.chunk_id ");
-        // 计分仅用于演示：此处按词出现次数
-        sql.Append("ORDER BY (SELECT COUNT(*) FROM STRING_SPLIT(c.[text], ' ') WHERE value IN @Words) DESC;");
+        if (topK <= 0) return Array.Empty<DocumentChunk>();
+
+        var terms = QueryTokenizer.Tokenize(query);
+        if (terms.Count == 0) return Array.Empty<DocumentChunk>();
+
+        var filter = BuildFilter(documentId, version, language);
 
         await using var conn = db.CreateConnection();
-        var rows = await conn.QueryAsync<ChunkRow>(sql.ToString(), new
+
+        // 1) 语料统计：一次查询同时拿到 chunk 总数、平均长度与每个检索词的文档频率
+        var stats = await LoadCorpusStatsAsync(conn, filter, terms, documentId, version, language, ct)
+            .ConfigureAwait(false);
+        if (stats is null || stats.DocumentCount == 0) return Array.Empty<DocumentChunk>();
+
+        // 2) 粗筛：只取至少命中一个检索词的行，避免把整表拉进内存
+        var candidates = await LoadCandidatesAsync(conn, filter, terms, documentId, version, language, ct)
+            .ConfigureAwait(false);
+
+        // 3) 精排：BM25 计分放在内存里做，便于调参与单独测试
+        return candidates
+            .Select(chunk => (Chunk: chunk, Score: Bm25Scorer.Score(chunk.Text, terms, stats)))
+            .Where(x => x.Score > 0)
+            .OrderByDescending(x => x.Score)
+            .Take(topK)
+            .Select(x => x.Chunk)
+            .ToList();
+    }
+
+    /// <summary>
+    /// 构造过滤条件（以 "FROM dbo.chunk c WHERE 1=1" 开头）。
+    /// 未显式指定版本时默认限定到最新版（需求文档 FR3）——通过 document 表的 is_latest 标记。
+    /// </summary>
+    private static string BuildFilter(string? documentId, string? version, LanguageCode? language)
+    {
+        var sql = new StringBuilder("FROM dbo.chunk c WHERE 1=1");
+
+        if (documentId is not null)
+            sql.Append(" AND c.document_id = @DocumentId");
+
+        if (version is not null)
+            sql.Append(" AND c.version = @Version");
+        else
+            sql.Append(" AND EXISTS (SELECT 1 FROM dbo.document d"
+                       + " WHERE d.document_id = c.document_id AND d.version = c.version AND d.is_latest = 1)");
+
+        if (language is not null && language != LanguageCode.ZhEn)
+            sql.Append(" AND c.[language] = @Lang");
+
+        return sql.ToString();
+    }
+
+    /// <summary>过滤参数（每个查询各建一份，避免参数串用）。</summary>
+    private static DynamicParameters BuildFilterArgs(
+        string? documentId, string? version, LanguageCode? language)
+    {
+        var args = new DynamicParameters();
+        if (documentId is not null) args.Add("DocumentId", documentId);
+        if (version is not null) args.Add("Version", version);
+        if (language is not null && language != LanguageCode.ZhEn) args.Add("Lang", (int)language.Value);
+        return args;
+    }
+
+    private static async Task<CorpusStats?> LoadCorpusStatsAsync(
+        DbConnection conn,
+        string filter,
+        IReadOnlyList<string> terms,
+        string? documentId,
+        string? version,
+        LanguageCode? language,
+        CancellationToken ct)
+    {
+        // 每个词的文档频率用条件聚合一次算出，再用 CONCAT 拼成一列返回。
+        // 不用动态行（DapperRow）：非泛型重载返回 object，运行时索引器会抛 RuntimeBinderException。
+        var dfParts = new List<string>(terms.Count);
+        for (var i = 0; i < terms.Count; i++)
+            dfParts.Add($"SUM(CASE WHEN c.[text] LIKE @Like{i} THEN 1 ELSE 0 END)");
+
+        var sql = new StringBuilder("SELECT COUNT(*) AS DocCount, ")
+            .Append("ISNULL(AVG(CAST(LEN(c.[text]) AS FLOAT)), 0) AS AvgLen, ")
+            // CONCAT 至少需要 2 个参数，单检索词时补一个空串占位
+            .Append("CONCAT('', ").Append(string.Join(", ',', ", dfParts)).Append(") AS DfList ")
+            .Append(filter);
+
+        var args = BuildFilterArgs(documentId, version, language);
+        for (var i = 0; i < terms.Count; i++)
+            args.Add($"Like{i}", $"%{EscapeLike(terms[i])}%");
+
+        var row = await conn.QuerySingleOrDefaultAsync<CorpusStatsRow>(
+            new CommandDefinition(sql.ToString(), args, cancellationToken: ct)).ConfigureAwait(false);
+        if (row is null) return null;
+
+        var dfValues = (row.DfList ?? string.Empty).Split(',');
+        var df = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < terms.Count; i++)
         {
-            TopK = topK,
-            DocumentId = documentId,
-            Version = version,
-            Lang = language.HasValue ? (int)language.Value : (int?)null,
-            Words = words,
-        }).ConfigureAwait(false);
+            df[terms[i]] = i < dfValues.Length && int.TryParse(dfValues[i], out var value) ? value : 0;
+        }
+
+        return new CorpusStats(row.DocCount, row.AvgLen, df);
+    }
+
+    private static async Task<IReadOnlyList<DocumentChunk>> LoadCandidatesAsync(
+        DbConnection conn,
+        string filter,
+        IReadOnlyList<string> terms,
+        string? documentId,
+        string? version,
+        LanguageCode? language,
+        CancellationToken ct)
+    {
+        var likes = new List<string>(terms.Count);
+        for (var i = 0; i < terms.Count; i++)
+            likes.Add($"c.[text] LIKE @Like{i}");
+
+        var sql = $"SELECT TOP (@CandidateLimit) c.* {filter} AND ({string.Join(" OR ", likes)})";
+
+        var args = BuildFilterArgs(documentId, version, language);
+        for (var i = 0; i < terms.Count; i++)
+            args.Add($"Like{i}", $"%{EscapeLike(terms[i])}%");
+        args.Add("CandidateLimit", CandidateLimit);
+
+        var rows = await conn.QueryAsync<ChunkRow>(
+            new CommandDefinition(sql, args, cancellationToken: ct)).ConfigureAwait(false);
+
         return rows.Select(r => r.ToDomain()).ToList();
     }
 
-    public async Task<IReadOnlyList<DocumentChunk>> VectorSearchAsync(
+    /// <summary>转义 LIKE 通配符，避免用户输入的 % 或 _ 被当成模式（SQL Server 用方括号转义）。</summary>
+    private static string EscapeLike(string value) =>
+        value.Replace("[", "[[]").Replace("%", "[%]").Replace("_", "[_]");
+
+    /// <summary>
+    /// 向量检索尚未实现：接入 IEmbeddingProvider 后按余弦相似度实现。
+    /// 此处返回空集，而不是拿关键词结果冒充向量结果——避免上层误判「向量路已经可用」。
+    /// </summary>
+    public Task<IReadOnlyList<DocumentChunk>> VectorSearchAsync(
         float[] queryVector, int topK, string? documentId, string? version, LanguageCode? language, CancellationToken ct = default)
-        => await KeywordSearchAsync("", topK, documentId, version, language, ct); // 占位：向量库接入后实现
+        => Task.FromResult<IReadOnlyList<DocumentChunk>>(Array.Empty<DocumentChunk>());
 
     public async Task<DocumentChunk?> GetChunkAsync(string chunkId, CancellationToken ct = default)
     {
@@ -87,6 +205,14 @@ public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
         var row = await conn.QuerySingleOrDefaultAsync<ChunkRow>(
             "SELECT * FROM dbo.chunk WHERE chunk_id=@ChunkId;", new { ChunkId = chunkId }).ConfigureAwait(false);
         return row?.ToDomain();
+    }
+
+    /// <summary>语料统计的查询结果（df 列表以逗号拼接，避免动态行）。</summary>
+    private sealed class CorpusStatsRow
+    {
+        public int DocCount { get; set; }
+        public double AvgLen { get; set; }
+        public string? DfList { get; set; }
     }
 
     // SQL 行映射（用属性映射而非位置记录：可空列 + SELECT * 的额外列
