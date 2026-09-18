@@ -53,6 +53,22 @@ IF COL_LENGTH(N'dbo.document', N'type_reasons') IS NULL
     ALTER TABLE dbo.document ADD type_reasons NVARCHAR(512) NULL;
 GO
 
+-- 数据纠正：老库的 is_latest 是在修复前写入的（只在首次导入时置位，导致新版本导入后旧版仍被当成最新）。
+-- 语义统一为「每个 document_id 下最近导入的版本为最新」。幂等：已正确时 WHERE 不命中任何行。
+-- 待引入正式数据库迁移机制后，本段应移入一次性迁移脚本。
+;WITH ranked AS (
+    SELECT document_id,
+           version,
+           ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY imported_at DESC) AS rn
+    FROM dbo.document
+)
+UPDATE d
+SET d.is_latest = CASE WHEN r.rn = 1 THEN 1 ELSE 0 END
+FROM dbo.document d
+JOIN ranked r ON r.document_id = d.document_id AND r.version = d.version
+WHERE d.is_latest <> CASE WHEN r.rn = 1 THEN 1 ELSE 0 END;
+GO
+
 -- chunk：检索最小单元（手册=段落/表格，宣传册=版面块）；bbox 支持前端高亮溯源
 IF OBJECT_ID(N'dbo.chunk', N'U') IS NULL
 BEGIN

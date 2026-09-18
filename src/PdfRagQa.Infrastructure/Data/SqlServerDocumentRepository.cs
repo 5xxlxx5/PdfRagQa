@@ -8,9 +8,21 @@ namespace PdfRagQa.Infrastructure.Data;
 /// <summary>SQL Server 文档元数据仓库（Dapper）。</summary>
 public sealed class SqlServerDocumentRepository(DbConfig db) : IDocumentRepository
 {
+    /// <summary>
+    /// 写入文档元数据。
+    ///
+    /// is_latest 由本方法维护，不由调用方计算：先清掉该文档其他版本的标记，再把本次写入的版本标为最新。
+    /// 「最新」的定义是**最近一次导入的版本**——之前只在首次导入时置位，导致新版本导入后旧版仍被当成最新，
+    /// 检索默认限定最新版时会返回最旧的内容。
+    /// </summary>
     public async Task UpsertAsync(Document document, CancellationToken ct = default)
     {
-        const string sql = """
+        const string clearLatestSql = """
+            UPDATE dbo.document SET is_latest = 0
+            WHERE document_id = @DocumentId AND is_latest = 1;
+            """;
+
+        const string mergeSql = """
             MERGE dbo.document WITH (HOLDLOCK) AS t
             USING (SELECT @DocumentId AS document_id, @Version AS version) AS s
               ON t.document_id = s.document_id AND t.version = s.version
@@ -18,16 +30,26 @@ public sealed class SqlServerDocumentRepository(DbConfig db) : IDocumentReposito
                 UPDATE SET title=@Title, doc_type=@Type, [language]=@Lang,
                            source_file=@SourceFile, imported_at=@ImportedAt, content_hash=@ContentHash,
                            type_source=@TypeSource, declared_type=@DeclaredType,
-                           auto_type=@AutoType, type_reasons=@TypeReasons
+                           auto_type=@AutoType, type_reasons=@TypeReasons, is_latest=1
             WHEN NOT MATCHED THEN
                 INSERT (document_id, version, title, doc_type, [language], source_file, is_latest, imported_at, content_hash,
                         type_source, declared_type, auto_type, type_reasons)
-                VALUES (@DocumentId, @Version, @Title, @Type, @Lang, @SourceFile, @IsLatest, @ImportedAt, @ContentHash,
+                VALUES (@DocumentId, @Version, @Title, @Type, @Lang, @SourceFile, 1, @ImportedAt, @ContentHash,
                         @TypeSource, @DeclaredType, @AutoType, @TypeReasons);
             """;
 
         await using var conn = db.CreateConnection();
-        await conn.ExecuteAsync(sql, new
+        await conn.OpenAsync(ct).ConfigureAwait(false);
+        await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+
+        await conn.ExecuteAsync(new CommandDefinition(
+            clearLatestSql,
+            new { document.DocumentId },
+            tx,
+            commandTimeout: 30,
+            cancellationToken: ct)).ConfigureAwait(false);
+
+        await conn.ExecuteAsync(new CommandDefinition(mergeSql, new
         {
             document.DocumentId,
             document.Version,
@@ -35,15 +57,15 @@ public sealed class SqlServerDocumentRepository(DbConfig db) : IDocumentReposito
             Type = (int)document.Type,
             Lang = (int)document.Language,
             document.SourceFile,
-            document.IsLatest,
             document.ImportedAt,
             ContentHash = (string?)document.SourceFile is null ? null : SimpleHash(document.SourceFile),
             TypeSource = document.TypeSource.ToString(),
             DeclaredType = document.DeclaredType.HasValue ? (int?)document.DeclaredType.Value : null,
             AutoType = document.AutoType.HasValue ? (int?)document.AutoType.Value : null,
             document.TypeReasons,
-        }, transaction: null, commandTimeout: 30)
-            .ConfigureAwait(false);
+        }, tx, commandTimeout: 30, cancellationToken: ct)).ConfigureAwait(false);
+
+        await tx.CommitAsync(ct).ConfigureAwait(false);
     }
 
     public async Task<Document?> GetAsync(string documentId, string? version = null, CancellationToken ct = default)

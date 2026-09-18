@@ -54,8 +54,10 @@ public sealed class DocumentIngestionService(
             TypeReasons = string.Join("; ", notes),
             Language = request.Language ?? LanguageCode.Zh,
             SourceFile = request.FilePath,
-            IsLatest = await repository.GetLatestAsync(docId, ct) is null,
             ImportedAt = DateTimeOffset.UtcNow,
+            // IsLatest 由仓储在写入时统一维护（先清掉同文档其他版本的标记，再把本次版本标为最新）。
+            // 调用方不需要也不应该自己计算——原先在这里按「是否首次导入」判断，
+            // 导致新版本导入后旧版仍被标为最新，检索默认限定最新版时会返回最旧的内容。
         };
         await repository.UpsertAsync(doc, ct);
 
