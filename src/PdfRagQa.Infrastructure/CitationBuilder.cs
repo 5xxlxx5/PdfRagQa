@@ -35,5 +35,8 @@ public sealed class CitationBuilder : ICitationBuilder
         PageNo = chunk.PageNo,
         Bbox = chunk.Bbox,
         Section = chunk.Section,
+        TextPreview = Truncate(chunk.Text, 200),
     };
+
+    private static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
 }

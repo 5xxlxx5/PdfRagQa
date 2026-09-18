@@ -5,6 +5,7 @@ using PdfRagQa.Application.Services;
 using PdfRagQa.Domain.Abstractions;
 using PdfRagQa.Infrastructure.Data;
 using PdfRagQa.Infrastructure.Embedding;
+using PdfRagQa.Infrastructure.Imports;
 using PdfRagQa.Infrastructure.LLM;
 using PdfRagQa.Infrastructure.Pdf;
 using PdfRagQa.Infrastructure.Retrieval;
@@ -67,6 +68,9 @@ public static class DependencyInjection
         services.AddScoped<QuestionService>();
         services.AddScoped<DocumentIngestionService>();
         services.AddScoped<FeedbackService>();
+
+        // 后台导入作业调度（POST/import 立即返回 jobId，导入后台执行、前端轮询进度）
+        services.AddSingleton<ImportJobRunner>();
 
         return services;
     }

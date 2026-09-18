@@ -38,6 +38,8 @@ public sealed class PdfPigTextExtractor : IPdfTextExtractor
 
         var words = ExtractPageWords(page);
         return words.Count == 0 ? string.Empty : string.Join(" ", words.Select(w => w.Text));
+
+
     }
 
     private static IReadOnlyList<PdfWord> ExtractPageWords(Page page)

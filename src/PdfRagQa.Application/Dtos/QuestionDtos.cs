@@ -46,6 +46,9 @@ public sealed class CitationDto
     public int PageNo { get; init; }
     public string Section { get; init; } = string.Empty;
     public BoundingBoxDto? Bbox { get; init; }
+
+    /// <summary>支撑该答案的原文片段（截断），供前端溯源展示。</summary>
+    public string TextPreview { get; init; } = string.Empty;
 }
 
 public sealed class BoundingBoxDto(double x, double y, double w, double h)

@@ -27,7 +27,9 @@ public sealed class DocumentIngestionService(
     IDocumentRepository repository)
 {
     public async Task<ImportDocumentResult> ImportAsync(
-        ImportDocumentRequest request, CancellationToken ct = default)
+        ImportDocumentRequest request,
+        IProgress<ImportProgressUpdate>? progress = null,
+        CancellationToken ct = default)
     {
         var declared = request.DocumentType;
         var type = declared ?? DocumentType.Manual;
@@ -44,10 +46,10 @@ public sealed class DocumentIngestionService(
         var notes = new List<string>();
 
         var chunks = type == DocumentType.Manual
-            ? await ParseManualAsync(docId, version, request.FilePath, notes, warnings, ct)
-            : await ParseBrochureAsync(docId, version, request.FilePath, notes, warnings, ct);
+            ? await ParseManualAsync(docId, version, request.FilePath, notes, warnings, progress, ct)
+            : await ParseBrochureAsync(docId, version, request.FilePath, notes, warnings, progress, ct);
 
-        var chunkCount = await WriteChunksAsync(chunks, notes, warnings, ct);
+        var chunkCount = await WriteChunksAsync(chunks, notes, warnings, progress, ct);
 
         var doc = new Document
         {
@@ -84,9 +86,12 @@ public sealed class DocumentIngestionService(
         string filePath,
         List<string> notes,
         List<string> warnings,
+        IProgress<ImportProgressUpdate>? progress,
         CancellationToken ct)
     {
+        progress?.Report(new ImportProgressUpdate("文本抽取", 0, null, "正在解析文本层…"));
         var pages = await textExtractor.ExtractAsync(filePath, ct);
+        progress?.Report(new ImportProgressUpdate("文本抽取", pages.Count, pages.Count, $"解析完成 {pages.Count} 页"));
         var totalChars = pages.Sum(p => p.Text.Length);
         var totalWords = pages.Sum(p => p.Words.Count);
         notes.Add($"文本链路：{pages.Count} 页，{totalChars} 字符，{totalWords} 个词项");
@@ -121,6 +126,7 @@ public sealed class DocumentIngestionService(
         string filePath,
         List<string> notes,
         List<string> warnings,
+        IProgress<ImportProgressUpdate>? progress,
         CancellationToken ct)
     {
         var rendered = 0;
@@ -131,6 +137,7 @@ public sealed class DocumentIngestionService(
         await foreach (var image in pageRenderer.RenderAsync(filePath, ct))
         {
             rendered++;
+            progress?.Report(new ImportProgressUpdate("视觉识别", rendered, null, $"正在识别第 {image.PageNo} 页…"));
 
             var result = await visionExtractor.RecognizeAsync(
                 new VisionRequest(image.PageNo, image.PngBytes), ct);
@@ -177,6 +184,7 @@ public sealed class DocumentIngestionService(
         List<DocumentChunk> chunks,
         List<string> notes,
         List<string> warnings,
+        IProgress<ImportProgressUpdate>? progress,
         CancellationToken ct)
     {
         if (chunks.Count == 0) return 0;
@@ -202,6 +210,7 @@ public sealed class DocumentIngestionService(
 
             await vectorStore.UpsertChunkAsync(chunk, vector, ct);
             written++;
+            progress?.Report(new ImportProgressUpdate("向量化写入", written, chunks.Count, $"写入第 {written}/{chunks.Count} 个块"));
         }
 
         notes.Add($"已写入 {written} 个块");

@@ -62,5 +62,6 @@ public sealed class RagOrchestr(
         PageNo = c.PageNo,
         Section = c.Section,
         Bbox = c.Bbox is null ? null : new BoundingBoxDto(c.Bbox.Value.X, c.Bbox.Value.Y, c.Bbox.Value.Width, c.Bbox.Value.Height),
+        TextPreview = c.TextPreview,
     };
 }

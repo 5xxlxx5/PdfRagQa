@@ -166,6 +166,7 @@ public sealed class OpenAiCompatibleChatClient : ILlmClient
     }
 
     /// <summary>从答案中解析出模型标注的片段序号，越界序号直接丢弃。</summary>
+    /// 
     private static IReadOnlyList<int> ExtractUsedIndexes(string answer, int contextCount)
     {
         var indexes = new SortedSet<int>();
