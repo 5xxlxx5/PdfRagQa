@@ -46,7 +46,8 @@ public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
             chunk.ImageDescription,
             chunk.EmbeddingModel,
             chunk.Dimension,
-            VectorJson = vector is null ? null : string.Join(',', vector),
+            // 向量为空时写 NULL 而不是空字符串，便于区分「未生成向量」与「向量异常」
+            VectorJson = vector is { Length: > 0 } ? string.Join(',', vector) : null,
         }, transaction: null, commandTimeout: 30).ConfigureAwait(false);
     }
 
@@ -88,12 +89,27 @@ public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
         return row?.ToDomain();
     }
 
-    private sealed record ChunkRow(
-        string Chunk_id, string Document_id, string Version, int Language, int Page_no,
-        double? Bbox_x, double? Bbox_y, double? Bbox_w, double? Bbox_h, string? Section,
-        string Text, string? Table_markdown, string? Image_ref, string? Image_description,
-        string? Embedding_model, int? Dimension)
+    // SQL 行映射（用属性映射而非位置记录：可空列 + SELECT * 的额外列
+    // 会让位置记录的严格构造签名匹配失败，Dapper 直接抛异常）
+    private sealed class ChunkRow
     {
+        public string Chunk_id { get; set; } = string.Empty;
+        public string Document_id { get; set; } = string.Empty;
+        public string Version { get; set; } = string.Empty;
+        public int Language { get; set; }
+        public int Page_no { get; set; }
+        public double? Bbox_x { get; set; }
+        public double? Bbox_y { get; set; }
+        public double? Bbox_w { get; set; }
+        public double? Bbox_h { get; set; }
+        public string? Section { get; set; }
+        public string Text { get; set; } = string.Empty;
+        public string? Table_markdown { get; set; }
+        public string? Image_ref { get; set; }
+        public string? Image_description { get; set; }
+        public string? Embedding_model { get; set; }
+        public int? Dimension { get; set; }
+
         public DocumentChunk ToDomain() => new()
         {
             ChunkId = Chunk_id,
