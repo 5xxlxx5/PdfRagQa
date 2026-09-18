@@ -19,3 +19,6 @@ logs/
 temp/
 Thumbs.db
 .DS_Store
+
+# AI 助手的工作记忆与本地计划，不属于项目源码
+.workbuddy-ai/
