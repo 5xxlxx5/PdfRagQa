@@ -16,10 +16,14 @@ public sealed class SqlServerDocumentRepository(DbConfig db) : IDocumentReposito
               ON t.document_id = s.document_id AND t.version = s.version
             WHEN MATCHED THEN
                 UPDATE SET title=@Title, doc_type=@Type, [language]=@Lang,
-                           source_file=@SourceFile, imported_at=@ImportedAt, content_hash=@ContentHash
+                           source_file=@SourceFile, imported_at=@ImportedAt, content_hash=@ContentHash,
+                           type_source=@TypeSource, declared_type=@DeclaredType,
+                           auto_type=@AutoType, type_reasons=@TypeReasons
             WHEN NOT MATCHED THEN
-                INSERT (document_id, version, title, doc_type, [language], source_file, is_latest, imported_at, content_hash)
-                VALUES (@DocumentId, @Version, @Title, @Type, @Lang, @SourceFile, @IsLatest, @ImportedAt, @ContentHash);
+                INSERT (document_id, version, title, doc_type, [language], source_file, is_latest, imported_at, content_hash,
+                        type_source, declared_type, auto_type, type_reasons)
+                VALUES (@DocumentId, @Version, @Title, @Type, @Lang, @SourceFile, @IsLatest, @ImportedAt, @ContentHash,
+                        @TypeSource, @DeclaredType, @AutoType, @TypeReasons);
             """;
 
         await using var conn = db.CreateConnection();
@@ -34,6 +38,10 @@ public sealed class SqlServerDocumentRepository(DbConfig db) : IDocumentReposito
             document.IsLatest,
             document.ImportedAt,
             ContentHash = (string?)document.SourceFile is null ? null : SimpleHash(document.SourceFile),
+            TypeSource = document.TypeSource.ToString(),
+            DeclaredType = document.DeclaredType.HasValue ? (int?)document.DeclaredType.Value : null,
+            AutoType = document.AutoType.HasValue ? (int?)document.AutoType.Value : null,
+            document.TypeReasons,
         }, transaction: null, commandTimeout: 30)
             .ConfigureAwait(false);
     }
@@ -75,11 +83,23 @@ public sealed class SqlServerDocumentRepository(DbConfig db) : IDocumentReposito
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
-    // SQL 行映射记录（避免 Dapper 与领域实体耦合标签）
-    private sealed record DocumentRow(
-        string Document_id, string Version, string Title, int Doc_type, int Language,
-        string? Source_file, bool Is_latest, DateTimeOffset Imported_at, string? Content_hash)
+    // SQL 行映射（用属性映射而非位置记录：可空列在位置记录上会因签名严格匹配而失败）
+    private sealed class DocumentRow
     {
+        public string Document_id { get; set; } = string.Empty;
+        public string Version { get; set; } = string.Empty;
+        public string Title { get; set; } = string.Empty;
+        public int Doc_type { get; set; }
+        public int Language { get; set; }
+        public string? Source_file { get; set; }
+        public bool Is_latest { get; set; }
+        public DateTime Imported_at { get; set; }
+        public string? Content_hash { get; set; }
+        public string? Type_source { get; set; }
+        public int? Declared_type { get; set; }
+        public int? Auto_type { get; set; }
+        public string? Type_reasons { get; set; }
+
         public Document ToDomain() => new()
         {
             DocumentId = Document_id,
@@ -89,7 +109,14 @@ public sealed class SqlServerDocumentRepository(DbConfig db) : IDocumentReposito
             Language = (LanguageCode)Language,
             SourceFile = Source_file ?? string.Empty,
             IsLatest = Is_latest,
-            ImportedAt = Imported_at,
+            // 库中统一存 UTC（写入时用 DateTimeOffset.UtcNow），读回时按 UTC 还原
+            ImportedAt = new DateTimeOffset(DateTime.SpecifyKind(Imported_at, DateTimeKind.Utc)),
+            TypeSource = Enum.TryParse<DocumentTypeSource>(Type_source, ignoreCase: true, out var src)
+                ? src
+                : DocumentTypeSource.Auto,
+            DeclaredType = Declared_type.HasValue ? (DocumentType)Declared_type.Value : null,
+            AutoType = Auto_type.HasValue ? (DocumentType)Auto_type.Value : null,
+            TypeReasons = Type_reasons,
         };
     }
 }
