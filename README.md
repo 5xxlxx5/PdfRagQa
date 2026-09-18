@@ -216,6 +216,7 @@ Domain           实体 · 端口 · 枚举（零外部依赖）
 | 问答返回「【生成模型未配置】」 | `appsettings.Development.json` 未被加载，检查 `ASPNETCORE_ENVIRONMENT` |
 | 构建失败且报 DLL 被占用 | 有旧服务实例在运行，先停止它 |
 | 中文 JSON 请求体导致 400 | Git Bash 会把非 ASCII 命令行参数转成系统 ANSI 编码，改用文件传参（`--data-binary @file`） |
+| 部署到反向代理后出现重定向死循环 | TLS 在代理层终止时，应用看到的是 http 会反复跳转。需配置 `ForwardedHeaders` 并限定可信代理（`KnownProxies` / `KnownNetworks`），**不能无条件信任请求头** |
 
 ---
 
