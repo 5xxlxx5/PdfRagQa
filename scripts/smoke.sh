@@ -90,7 +90,10 @@ else
     exit 1
   fi
 
-  ( cd "$REPO_ROOT/$API_DIR_REL" && exec dotnet "$API_DLL_REL" --urls "$BASE_URL" ) \
+  # 必须显式指定 Development：直接运行 DLL 不会读取 launchSettings.json，
+  # 默认环境是 Production，那样 appsettings.Development.json（本地密钥所在）不会被加载。
+  ( cd "$REPO_ROOT/$API_DIR_REL" \
+    && ASPNETCORE_ENVIRONMENT=Development exec dotnet "$API_DLL_REL" --urls "$BASE_URL" ) \
     >"$TMP_DIR/api.log" 2>&1 &
   API_PID=$!
 
