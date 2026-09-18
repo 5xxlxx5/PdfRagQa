@@ -14,11 +14,15 @@ namespace PdfRagQa.Application.Services;
 /// 宣传手册之所以走视觉链路，一是它不受 PDF 文字层编码影响
 /// （例如方正 GBK-EUC-H 预定义 CMap 会让文本抽取产出乱码），
 /// 二是宣传册的信息主要承载在版面上（配图、卖点排布、型号矩阵），纯文本链路拿不到。
+///
+/// 解析结果统一经 IEmbeddingProvider 向量化后写入 chunk 表。
+/// 向量化失败不阻断导入：先把文本存下来，向量可以后补，但要明确告警。
 /// </summary>
 public sealed class DocumentIngestionService(
     IPdfTextExtractor textExtractor,
     IPdfPageRenderer pageRenderer,
     IVisionExtractor visionExtractor,
+    IEmbeddingProvider embeddingProvider,
     IVectorStore vectorStore,
     IDocumentRepository repository)
 {
@@ -39,9 +43,11 @@ public sealed class DocumentIngestionService(
         var version = request.Version ?? "1.0";
         var notes = new List<string>();
 
-        var chunkCount = type == DocumentType.Manual
+        var chunks = type == DocumentType.Manual
             ? await ParseManualAsync(docId, version, request.FilePath, notes, warnings, ct)
             : await ParseBrochureAsync(docId, version, request.FilePath, notes, warnings, ct);
+
+        var chunkCount = await WriteChunksAsync(chunks, notes, warnings, ct);
 
         var doc = new Document
         {
@@ -71,8 +77,8 @@ public sealed class DocumentIngestionService(
             Warnings: warnings);
     }
 
-    /// <summary>使用手册链路：文本抽取，按页写入文本块，返回写入数量。</summary>
-    private async Task<int> ParseManualAsync(
+    /// <summary>使用手册链路：文本抽取，按页产出一个文本块。</summary>
+    private async Task<List<DocumentChunk>> ParseManualAsync(
         string documentId,
         string version,
         string filePath,
@@ -92,34 +98,24 @@ public sealed class DocumentIngestionService(
                 + "若确认是图片型文档，请把 documentType 改为宣传手册走视觉链路。");
         }
 
-        var written = 0;
-        foreach (var page in pages)
-        {
-            if (string.IsNullOrWhiteSpace(page.Text)) continue;
-
-            await vectorStore.UpsertChunkAsync(
-                new DocumentChunk
-                {
-                    ChunkId = BuildChunkId(documentId, version, page.PageNo),
-                    DocumentId = documentId,
-                    Version = version,
-                    PageNo = page.PageNo,
-                    // 页级 bbox：整页范围，后续做段落级切片时会细化为词项并集
-                    Bbox = new BoundingBox(0, 0, page.Width, page.Height),
-                    Section = string.Empty,
-                    Text = page.Text,
-                },
-                Array.Empty<float>(),
-                ct);
-            written++;
-        }
-
-        notes.Add($"已写入 {written} 个文本块（按页）");
-        return written;
+        return pages
+            .Where(page => !string.IsNullOrWhiteSpace(page.Text))
+            .Select(page => new DocumentChunk
+            {
+                ChunkId = BuildChunkId(documentId, version, page.PageNo),
+                DocumentId = documentId,
+                Version = version,
+                PageNo = page.PageNo,
+                // 页级 bbox：整页范围，后续做段落级切片时会细化为词项并集
+                Bbox = new BoundingBox(0, 0, page.Width, page.Height),
+                Section = string.Empty,
+                Text = page.Text,
+            })
+            .ToList();
     }
 
-    /// <summary>宣传手册链路：逐页渲染 + 视觉识别，按页写入内容块，返回写入数量。</summary>
-    private async Task<int> ParseBrochureAsync(
+    /// <summary>宣传手册链路：逐页渲染 + 视觉识别，识别成功才产出一个内容块。</summary>
+    private async Task<List<DocumentChunk>> ParseBrochureAsync(
         string documentId,
         string version,
         string filePath,
@@ -129,8 +125,8 @@ public sealed class DocumentIngestionService(
     {
         var rendered = 0;
         var recognized = 0;
-        var written = 0;
         var errors = new List<string>();
+        var chunks = new List<DocumentChunk>();
 
         await foreach (var image in pageRenderer.RenderAsync(filePath, ct))
         {
@@ -146,33 +142,69 @@ public sealed class DocumentIngestionService(
             }
 
             recognized++;
-
-            await vectorStore.UpsertChunkAsync(
-                new DocumentChunk
-                {
-                    ChunkId = BuildChunkId(documentId, version, image.PageNo),
-                    DocumentId = documentId,
-                    Version = version,
-                    PageNo = image.PageNo,
-                    Bbox = new BoundingBox(0, 0, image.PixelWidth, image.PixelHeight),
-                    Section = string.Empty,
-                    Text = result.Content,
-                },
-                Array.Empty<float>(),
-                ct);
-            written++;
+            chunks.Add(new DocumentChunk
+            {
+                ChunkId = BuildChunkId(documentId, version, image.PageNo),
+                DocumentId = documentId,
+                Version = version,
+                PageNo = image.PageNo,
+                Bbox = new BoundingBox(0, 0, image.PixelWidth, image.PixelHeight),
+                Section = string.Empty,
+                Text = result.Content,
+            });
         }
 
-        notes.Add($"视觉链路：渲染 {rendered} 页，识别成功 {recognized} 页，写入 {written} 个内容块");
+        notes.Add($"视觉链路：渲染 {rendered} 页，识别成功 {recognized} 页");
 
         if (rendered == 0)
             warnings.Add("未能渲染出任何页面，请检查该 PDF 是否可正常打开。");
         else if (recognized == 0)
-            warnings.Add("所有页面均未识别成功，请检查 Ai 配置与视觉模型服务是否可用。");
+            warnings.Add("所有页面均未识别成功，请检查 Ai:Vision 配置与视觉模型服务是否可用。");
 
         if (errors.Count > 0)
             warnings.Add($"部分页面识别失败：{string.Join("；", errors)}");
 
+        return chunks;
+    }
+
+    /// <summary>
+    /// 批量向量化后写库。
+    ///
+    /// 向量化失败不中断导入：文本已经解析出来了，先落库保证内容不丢，
+    /// 向量可以后续回填，但必须告警说明「本次检索走不到向量路」。
+    /// </summary>
+    private async Task<int> WriteChunksAsync(
+        List<DocumentChunk> chunks,
+        List<string> notes,
+        List<string> warnings,
+        CancellationToken ct)
+    {
+        if (chunks.Count == 0) return 0;
+
+        float[][]? vectors = null;
+        try
+        {
+            var embedded = await embeddingProvider.EmbedTextsAsync(chunks.Select(c => c.Text), ct);
+            vectors = embedded.ToArray();
+            notes.Add($"已向量化 {vectors.Length} 个块（{embeddingProvider.ModelName}，{embeddingProvider.Dimension} 维）");
+        }
+        catch (Exception ex)
+        {
+            warnings.Add($"向量化失败，本次仅写入文本（向量检索将检索不到这些块）：{ex.Message}");
+        }
+
+        var written = 0;
+        foreach (var (chunk, index) in chunks.Select((c, i) => (c, i)))
+        {
+            var vector = vectors is not null && index < vectors.Length
+                ? vectors[index]
+                : Array.Empty<float>();
+
+            await vectorStore.UpsertChunkAsync(chunk, vector, ct);
+            written++;
+        }
+
+        notes.Add($"已写入 {written} 个块");
         return written;
     }
 

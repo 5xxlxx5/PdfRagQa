@@ -40,20 +40,20 @@ public sealed class OpenAiCompatibleVisionExtractor : IVisionExtractor
 
     public async Task<VisionResult> RecognizeAsync(VisionRequest request, CancellationToken ct = default)
     {
-        if (!_options.VisionConfigured)
+        if (!_options.Vision.IsConfigured)
         {
             return new VisionResult(
                 request.PageNo,
                 Succeeded: false,
                 Content: string.Empty,
-                Error: "未配置视觉模型（Ai:BaseUrl / Ai:ApiKey / Ai:VisionModel 需同时填写），已跳过识别");
+                Error: "未配置视觉模型（Ai:Vision:BaseUrl / ApiKey / Model 需同时填写），已跳过识别");
         }
 
         try
         {
             var payload = new
             {
-                model = _options.VisionModel,
+                model = _options.Vision.Model,
                 temperature = 0,
                 messages = new object[]
                 {
@@ -79,8 +79,8 @@ public sealed class OpenAiCompatibleVisionExtractor : IVisionExtractor
 
             using var httpRequest = new HttpRequestMessage(
                 HttpMethod.Post,
-                $"{_options.BaseUrl.TrimEnd('/')}/chat/completions");
-            httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.ApiKey);
+                $"{_options.Vision.BaseUrl.TrimEnd('/')}/chat/completions");
+            httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.Vision.ApiKey);
             httpRequest.Content = new StringContent(
                 JsonSerializer.Serialize(payload),
                 Encoding.UTF8,

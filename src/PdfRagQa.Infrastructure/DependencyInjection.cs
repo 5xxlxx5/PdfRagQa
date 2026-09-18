@@ -4,6 +4,7 @@ using PdfRagQa.Application.Abstractions;
 using PdfRagQa.Application.Services;
 using PdfRagQa.Domain.Abstractions;
 using PdfRagQa.Infrastructure.Data;
+using PdfRagQa.Infrastructure.Embedding;
 using PdfRagQa.Infrastructure.LLM;
 using PdfRagQa.Infrastructure.Pdf;
 using PdfRagQa.Infrastructure.Retrieval;
@@ -21,18 +22,24 @@ public static class DependencyInjection
         var connectionString = configuration.GetConnectionString("PdfRagQa")
                                ?? "Server=(localdb)\\MSSQLLocalDB;Database=PdfRagQa;Trusted_Connection=True;MultipleActiveResultSets=true;TrustServerCertificate=True";
         services.AddSingleton(new DbConfig(connectionString));
-        services.AddSingleton<DatabaseInitializer>();
 
-        // AI 服务配置（视觉模型走 OpenAI 兼容协议，可指向内网私有化部署）
+        // AI 服务配置：生成 / 视觉 / 向量化三项各自独立——
+        // 实际部署中它们常来自不同厂商（例如生成用 DeepSeek、向量化用阿里百炼），地址与密钥都不相同
         var aiOptions = new AiOptions
         {
-            BaseUrl = configuration[$"{AiOptions.SectionName}:BaseUrl"] ?? string.Empty,
-            ApiKey = configuration[$"{AiOptions.SectionName}:ApiKey"] ?? string.Empty,
-            VisionModel = configuration[$"{AiOptions.SectionName}:VisionModel"] ?? string.Empty,
-            RenderDpi = int.TryParse(configuration[$"{AiOptions.SectionName}:RenderDpi"], out var dpi) ? dpi : 120,
-            VisionTimeoutSeconds = int.TryParse(configuration[$"{AiOptions.SectionName}:VisionTimeoutSeconds"], out var timeout) ? timeout : 180,
+            Chat = ReadEndpoint(configuration, "Chat"),
+            Vision = ReadEndpoint(configuration, "Vision"),
+            Embedding = ReadEndpoint(configuration, "Embedding"),
+            EmbeddingDimensions = ReadInt(configuration, "EmbeddingDimensions", 1024),
+            EmbeddingBatchSize = ReadInt(configuration, "EmbeddingBatchSize", 10),
+            RenderDpi = ReadInt(configuration, "RenderDpi", 120),
+            VisionTimeoutSeconds = ReadInt(configuration, "VisionTimeoutSeconds", 180),
+            EmbeddingTimeoutSeconds = ReadInt(configuration, "EmbeddingTimeoutSeconds", 120),
         };
         services.AddSingleton(aiOptions);
+
+        // 数据库初始化依赖 AiOptions（启动时校验向量列维度与配置一致），故在此注册
+        services.AddSingleton<DatabaseInitializer>();
 
         // 领域端口 -> SQL Server 实现（持久化）
         services.AddSingleton<IDocumentRepository, SqlServerDocumentRepository>();
@@ -44,6 +51,7 @@ public static class DependencyInjection
         services.AddSingleton<IPdfTextExtractor, PdfPigTextExtractor>();
         services.AddSingleton<IPdfPageRenderer, PdfiumPageRenderer>();
         services.AddSingleton<IVisionExtractor, OpenAiCompatibleVisionExtractor>();
+        services.AddSingleton<IEmbeddingProvider, OpenAiCompatibleEmbeddingProvider>();
 
         services.AddSingleton<ILlmClient, StubLlmClient>();
         services.AddSingleton<ICitationBuilder, CitationBuilder>();
@@ -61,4 +69,14 @@ public static class DependencyInjection
 
         return services;
     }
+
+    private static AiEndpointOptions ReadEndpoint(IConfiguration configuration, string name) => new()
+    {
+        BaseUrl = configuration[$"{AiOptions.SectionName}:{name}:BaseUrl"] ?? string.Empty,
+        ApiKey = configuration[$"{AiOptions.SectionName}:{name}:ApiKey"] ?? string.Empty,
+        Model = configuration[$"{AiOptions.SectionName}:{name}:Model"] ?? string.Empty,
+    };
+
+    private static int ReadInt(IConfiguration configuration, string key, int fallback) =>
+        int.TryParse(configuration[$"{AiOptions.SectionName}:{key}"], out var value) ? value : fallback;
 }
