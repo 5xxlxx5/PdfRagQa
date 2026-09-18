@@ -10,6 +10,12 @@ public sealed class DocumentChunk
     public string DocumentId { get; init; } = string.Empty;
     public string Version { get; init; } = string.Empty;
 
+    /// <summary>
+    /// 所属文档标题。为引用展示而做的反规范化——检索时由 chunk 表关联 document 表一并取出，
+    /// 避免为每条引用再查一次文档元数据（需求文档 FR6 要求引用包含来源文档）。
+    /// </summary>
+    public string DocumentTitle { get; init; } = string.Empty;
+
     public int PageNo { get; init; }
     public BoundingBox? Bbox { get; init; }
     public string Section { get; init; } = string.Empty;

@@ -156,8 +156,11 @@ if [[ "$STATUS" != "200" ]]; then
   fail "HTTP $STATUS：$(printf '%s' "$BODY" | head -c 300)"
 elif ! printf '%s' "$BODY" | grep -q '"answer"'; then
   fail "响应缺少 answer 字段"
+elif printf '%s' "$BODY" | grep -q '生成模型未配置'; then
+  # 引用来自「模型在答案里标注的序号」，未配置生成模型时拿不到，属预期降级
+  info "生成模型未配置，跳过引用断言（检索链路已由 1) 2) 覆盖）"
 elif ! printf '%s' "$BODY" | grep -q '"citations":\[{'; then
-  # 中文分词或 BM25 计分一旦失效，检索会返回空集——这条断言专门守它
+  # 中文分词、BM25 计分或引用组装一旦失效，检索会静默返回空引用——这条断言专门守它
   fail "检索未返回任何引用（citations 为空）：$(printf '%s' "$BODY" | head -c 300)"
 else
   pass "HTTP 200，返回 answer 与 citations"

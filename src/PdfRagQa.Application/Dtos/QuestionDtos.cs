@@ -55,3 +55,34 @@ public sealed class BoundingBoxDto(double x, double y, double w, double h)
     public double Width { get; } = w;
     public double Height { get; } = h;
 }
+
+/// <summary>
+/// 检索预览请求：只跑检索、不调用生成模型。
+/// 用于调参与排障——引用只包含模型标注的片段，没有生成模型时无法从问答响应观察检索结果。
+/// </summary>
+public sealed class RetrievalPreviewRequest
+{
+    public string Query { get; init; } = string.Empty;
+    public string? DocumentId { get; init; }
+
+    /// <summary>留空则按需求文档 FR3 默认限定到最新版。</summary>
+    public string? Version { get; init; }
+
+    public LanguageCode? Language { get; init; }
+    public int TopK { get; init; } = 10;
+}
+
+/// <summary>检索预览结果项。<paramref name="TextPreview"/> 截断展示，避免响应过大。</summary>
+public sealed record RetrievalPreviewItem(
+    string ChunkId,
+    string DocumentId,
+    string DocumentTitle,
+    string Version,
+    int PageNo,
+    string Section,
+    string TextPreview);
+
+public sealed record RetrievalPreviewResponse(
+    string Query,
+    int Count,
+    IReadOnlyList<RetrievalPreviewItem> Chunks);

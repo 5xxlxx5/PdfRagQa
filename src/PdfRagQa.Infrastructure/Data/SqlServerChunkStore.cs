@@ -128,7 +128,7 @@ public sealed class SqlServerChunkStore(DbConfig db, AiOptions aiOptions) : IVec
         }
 
         var filter = BuildFilter(documentId, version, language);
-        var sql = $"SELECT TOP (@TopK) {Columns("c")} {filter} AND c.embedding IS NOT NULL "
+        var sql = $"SELECT TOP (@TopK) {Columns()} {filter} AND c.embedding IS NOT NULL "
                   + $"ORDER BY VECTOR_DISTANCE('cosine', c.embedding, CAST(@QueryVector AS VECTOR({_dimensions})));";
 
         var args = BuildFilterArgs(documentId, version, language);
@@ -147,7 +147,7 @@ public sealed class SqlServerChunkStore(DbConfig db, AiOptions aiOptions) : IVec
         await using var conn = db.CreateConnection();
         var row = await conn.QuerySingleOrDefaultAsync<ChunkRow>(
             new CommandDefinition(
-                $"SELECT {Columns("c")} FROM dbo.chunk c WHERE c.chunk_id = @ChunkId;",
+                $"SELECT {Columns()} {FromClause} WHERE c.chunk_id = @ChunkId;",
                 new { ChunkId = chunkId },
                 cancellationToken: ct)).ConfigureAwait(false);
         return row?.ToDomain();
@@ -156,13 +156,20 @@ public sealed class SqlServerChunkStore(DbConfig db, AiOptions aiOptions) : IVec
     /// <summary>
     /// 检索结果需要的列，显式列出而不 SELECT *：
     /// VECTOR 列映射到实体没有意义，也可能在读取时触发类型转换异常。
+    /// 同时关联出文档标题——引用展示需要它（需求文档 FR6），反规范化避免逐条回查。
     /// </summary>
-    private static string Columns(string alias) => string.Join(", ", new[]
-    {
-        "chunk_id", "document_id", "version", "[language]", "page_no",
-        "bbox_x", "bbox_y", "bbox_w", "bbox_h", "section", "[text]",
-        "table_markdown", "image_ref", "image_description", "embedding_model", "dimension",
-    }.Select(c => $"{alias}.{c}"));
+    private static string Columns() =>
+        string.Join(", ", new[]
+        {
+            "chunk_id", "document_id", "version", "[language]", "page_no",
+            "bbox_x", "bbox_y", "bbox_w", "bbox_h", "section", "[text]",
+            "table_markdown", "image_ref", "image_description", "embedding_model", "dimension",
+        }.Select(c => $"c.{c}")) + ", d.title AS document_title";
+
+    /// <summary>统一的 FROM 子句。用 LEFT JOIN 取文档标题，同时替代原先的 EXISTS 最新版判断。</summary>
+    private const string FromClause =
+        "FROM dbo.chunk c LEFT JOIN dbo.document d"
+        + " ON d.document_id = c.document_id AND d.version = c.version";
 
     /// <summary>把 float[] 转成 SQL Server VECTOR 接受的字面量，如 [0.1,0.2,0.3]。</summary>
     private static string ToVectorLiteral(float[] vector)
@@ -177,12 +184,13 @@ public sealed class SqlServerChunkStore(DbConfig db, AiOptions aiOptions) : IVec
     }
 
     /// <summary>
-    /// 构造过滤条件（以 "FROM dbo.chunk c WHERE 1=1" 开头）。
-    /// 未显式指定版本时默认限定到最新版（需求文档 FR3）——通过 document 表的 is_latest 标记。
+    /// 构造过滤条件（以 FROM 子句开头）。
+    /// 未显式指定版本时默认限定到最新版（需求文档 FR3）——用关联出的 document.is_latest 判断，
+    /// 原先用 EXISTS 子查询是因为没有关联 document 表，现在为了取标题已经 JOIN，不必再套一层。
     /// </summary>
     private static string BuildFilter(string? documentId, string? version, LanguageCode? language)
     {
-        var sql = new StringBuilder("FROM dbo.chunk c WHERE 1=1");
+        var sql = new StringBuilder(FromClause).Append(" WHERE 1=1");
 
         if (documentId is not null)
             sql.Append(" AND c.document_id = @DocumentId");
@@ -190,8 +198,7 @@ public sealed class SqlServerChunkStore(DbConfig db, AiOptions aiOptions) : IVec
         if (version is not null)
             sql.Append(" AND c.version = @Version");
         else
-            sql.Append(" AND EXISTS (SELECT 1 FROM dbo.document d"
-                       + " WHERE d.document_id = c.document_id AND d.version = c.version AND d.is_latest = 1)");
+            sql.Append(" AND d.is_latest = 1");
 
         if (language is not null && language != LanguageCode.ZhEn)
             sql.Append(" AND c.[language] = @Lang");
@@ -262,7 +269,7 @@ public sealed class SqlServerChunkStore(DbConfig db, AiOptions aiOptions) : IVec
         for (var i = 0; i < terms.Count; i++)
             likes.Add($"c.[text] LIKE @Like{i}");
 
-        var sql = $"SELECT TOP (@CandidateLimit) {Columns("c")} {filter} AND ({string.Join(" OR ", likes)})";
+        var sql = $"SELECT TOP (@CandidateLimit) {Columns()} {filter} AND ({string.Join(" OR ", likes)})";
 
         var args = BuildFilterArgs(documentId, version, language);
         for (var i = 0; i < terms.Count; i++)
@@ -293,6 +300,7 @@ public sealed class SqlServerChunkStore(DbConfig db, AiOptions aiOptions) : IVec
         public string Chunk_id { get; set; } = string.Empty;
         public string Document_id { get; set; } = string.Empty;
         public string Version { get; set; } = string.Empty;
+        public string? Document_title { get; set; }
         public int Language { get; set; }
         public int Page_no { get; set; }
         public double? Bbox_x { get; set; }
@@ -312,6 +320,7 @@ public sealed class SqlServerChunkStore(DbConfig db, AiOptions aiOptions) : IVec
             ChunkId = Chunk_id,
             DocumentId = Document_id,
             Version = Version,
+            DocumentTitle = Document_title ?? string.Empty,
             PageNo = Page_no,
             Bbox = Bbox_x is null ? null : new BoundingBox(Bbox_x.Value, Bbox_y ?? 0, Bbox_w ?? 0, Bbox_h ?? 0),
             Section = Section ?? string.Empty,
