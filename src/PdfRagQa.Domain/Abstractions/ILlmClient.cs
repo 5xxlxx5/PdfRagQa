@@ -12,11 +12,15 @@ public sealed class LlmRequest
 /// <summary>多轮对话中的历史消息。</summary>
 public sealed record ChatTurn(string Role, string Content);
 
-/// <summary>大模型生成结果（含算法返回的对应用原始引用索引，用于溯源）。</summary>
+/// <summary>
+/// 大模型生成结果。
+/// <see cref="UsedContextIndexes"/> 是模型在答案中标注引用的上下文片段序号（对应 LlmRequest.Context 的下标），
+/// 用于构造结构化引用；模型没有标注任何引用时为空集，此时不应凭空生成引用。
+/// </summary>
 public sealed class LlmResponse
 {
     public string Answer { get; init; } = string.Empty;
-    public IReadOnlyList<int> CachedChunkIndexes { get; init; } = [];
+    public IReadOnlyList<int> UsedContextIndexes { get; init; } = [];
 }
 
 public interface ILlmClient

@@ -53,13 +53,14 @@ public static class DependencyInjection
         services.AddSingleton<IVisionExtractor, OpenAiCompatibleVisionExtractor>();
         services.AddSingleton<IEmbeddingProvider, OpenAiCompatibleEmbeddingProvider>();
 
-        services.AddSingleton<ILlmClient, StubLlmClient>();
+        services.AddSingleton<ILlmClient, OpenAiCompatibleChatClient>();
         services.AddSingleton<ICitationBuilder, CitationBuilder>();
 
         // 应用抽象 -> 基础设施实现
         services.AddScoped<IDocumentRouter, DefaultDocumentRouter>();
         services.AddScoped<IRagOrchestr, RagOrchestr>();
-        services.AddScoped<IHybridRetriever, InMemoryHybridRetriever>();
+        // 混合检索：关键词 BM25 + 向量余弦双路，RRF 融合（需求文档 FR4）
+        services.AddScoped<IHybridRetriever, RrfHybridRetriever>();
         services.AddScoped<IMultimodalRetriever, InMemoryMultimodalRetriever>();
 
         // 应用服务
