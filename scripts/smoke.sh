@@ -156,6 +156,9 @@ if [[ "$STATUS" != "200" ]]; then
   fail "HTTP $STATUS：$(printf '%s' "$BODY" | head -c 300)"
 elif ! printf '%s' "$BODY" | grep -q '"answer"'; then
   fail "响应缺少 answer 字段"
+elif ! printf '%s' "$BODY" | grep -q '"citations":\[{'; then
+  # 中文分词或 BM25 计分一旦失效，检索会返回空集——这条断言专门守它
+  fail "检索未返回任何引用（citations 为空）：$(printf '%s' "$BODY" | head -c 300)"
 else
   pass "HTTP 200，返回 answer 与 citations"
 fi
