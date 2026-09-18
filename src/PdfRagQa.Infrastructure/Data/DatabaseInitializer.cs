@@ -2,8 +2,8 @@ using Microsoft.Data.SqlClient;
 
 namespace PdfRagQa.Infrastructure.Data;
 
-/// <summary>数据库初始器：按需建库并执行 schema.sql 创建表。</summary>
-public sealed class DatabaseInitializer(DbConfig db)
+/// <summary>数据库初始器：按需建库、执行 schema.sql 建表，并校验向量列维度与配置一致。</summary>
+public sealed class DatabaseInitializer(DbConfig db, AiOptions aiOptions)
 {
     public async Task InitializeAsync(CancellationToken ct = default)
     {
@@ -37,6 +37,39 @@ public sealed class DatabaseInitializer(DbConfig db)
             cmd.CommandText = batch;
             await cmd.ExecuteNonQueryAsync(ct);
         }
+
+        await ValidateVectorDimensionAsync(conn, ct);
+    }
+
+    /// <summary>
+    /// 校验 chunk.embedding 列的维度与配置一致。
+    ///
+    /// 维度不一致时向量检索会静默失效（距离算得出但结果无意义），且很难从症状反推原因，
+    /// 因此在启动阶段直接报错——这也是需求文档 FR10「换 embedding 模型必须重建索引」的落地机制。
+    /// </summary>
+    private async Task ValidateVectorDimensionAsync(System.Data.Common.DbConnection conn, CancellationToken ct)
+    {
+        await using var cmd = conn.CreateCommand();
+        // VECTOR(n) 的存储长度 = n × 4 字节 + 8 字节头，实测 VECTOR(3)=20 / VECTOR(256)=1032 / VECTOR(1536)=6152
+        cmd.CommandText = """
+            SELECT c.max_length
+            FROM sys.columns c
+            WHERE c.object_id = OBJECT_ID(N'dbo.chunk') AND c.name = N'embedding';
+            """;
+
+        var raw = await cmd.ExecuteScalarAsync(ct);
+        if (raw is null or DBNull) return;
+
+        var maxLength = Convert.ToInt32(raw);
+        if (maxLength < 8) return;
+
+        var columnDimension = (maxLength - 8) / 4;
+        if (columnDimension == aiOptions.EmbeddingDimensions) return;
+
+        throw new InvalidOperationException(
+            $"chunk.embedding 列维度为 {columnDimension}，但配置 Ai:EmbeddingDimensions = {aiOptions.EmbeddingDimensions}，两者必须一致。"
+            + "维度不一致会让向量检索静默失效。请统一二者后重建全部向量："
+            + "ALTER TABLE dbo.chunk ADD embedding VECTOR(<新维度>)（需先 DROP 旧列）→ 清空 embedding → 重新导入全部文档。");
     }
 
     private static async Task<string> ReadSchemaSqlAsync(CancellationToken ct)

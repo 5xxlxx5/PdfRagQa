@@ -1,4 +1,5 @@
 using System.Data.Common;
+using System.Globalization;
 using System.Text;
 using Dapper;
 using PdfRagQa.Domain;
@@ -10,17 +11,34 @@ namespace PdfRagQa.Infrastructure.Data;
 /// <summary>
 /// SQL Server 文本/向量存储（Dapper）。
 ///
-/// 关键词检索为真实实现：中文 bigram 分词 → 语料统计 → LIKE 粗筛候选 → 内存 BM25 精排。
-/// 向量检索尚未实现（接入 IEmbeddingProvider 后替换），当前返回空集而不是拿关键词结果冒充。
+/// 关键词检索：中文 bigram 分词 → 语料统计 → LIKE 粗筛候选 → 内存 BM25 精排。
+/// 向量检索：SQL Server 2025 原生 VECTOR 类型 + VECTOR_DISTANCE 余弦距离，
+///          因此不需要引入 Milvus / Qdrant 等独立向量库。
 /// </summary>
-public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
+public sealed class SqlServerChunkStore(DbConfig db, AiOptions aiOptions) : IVectorStore
 {
     /// <summary>粗筛候选上限：兜住「检索词极常见」时结果集过大的情况。</summary>
     private const int CandidateLimit = 2000;
 
+    private readonly int _dimensions = aiOptions.EmbeddingDimensions;
+
+    /// <summary>生成向量所用的模型名。与向量同源，故由本类维护，不依赖调用方传入。</summary>
+    private readonly string? _embeddingModel =
+        string.IsNullOrWhiteSpace(aiOptions.Embedding.Model) ? null : aiOptions.Embedding.Model;
+
     public async Task UpsertChunkAsync(DocumentChunk chunk, float[] vector, CancellationToken ct = default)
     {
-        const string sql = """
+        var hasVector = vector is { Length: > 0 };
+        if (hasVector && vector.Length != _dimensions)
+        {
+            throw new InvalidOperationException(
+                $"向量维度 {vector.Length} 与配置 Ai:EmbeddingDimensions = {_dimensions} 不一致，拒绝写入。");
+        }
+
+        // 维度必须写成字面量，VECTOR(@p) 不被支持；_dimensions 来自配置的 int，无注入风险
+        var embeddingExpr = hasVector ? $"CAST(@EmbeddingText AS VECTOR({_dimensions}))" : "NULL";
+
+        var sql = $"""
             MERGE dbo.chunk WITH (HOLDLOCK) AS t
             USING (SELECT @ChunkId AS chunk_id) AS s ON t.chunk_id = s.chunk_id
             WHEN MATCHED THEN
@@ -28,33 +46,40 @@ public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
                            bbox_x=@BboxX, bbox_y=@BboxY, bbox_w=@BboxW, bbox_h=@BboxH, section=@Section,
                            [text]=@Text, table_markdown=@TableMarkdown, image_ref=@ImageRef,
                            image_description=@ImageDescription, embedding_model=@EmbeddingModel,
-                           dimension=@Dimension, vector_json=@VectorJson
+                           dimension=@Dimension, vector_json=NULL, embedding={embeddingExpr}
             WHEN NOT MATCHED THEN
                 INSERT (chunk_id, document_id, version, [language], page_no, bbox_x, bbox_y, bbox_w, bbox_h,
-                        section, [text], table_markdown, image_ref, image_description, embedding_model, dimension, vector_json)
+                        section, [text], table_markdown, image_ref, image_description, embedding_model, dimension,
+                        vector_json, embedding)
                 VALUES (@ChunkId, @DocumentId, @Version, @Lang, @PageNo, @BboxX, @BboxY, @BboxW, @BboxH,
-                        @Section, @Text, @TableMarkdown, @ImageRef, @ImageDescription, @EmbeddingModel, @Dimension, @VectorJson);
+                        @Section, @Text, @TableMarkdown, @ImageRef, @ImageDescription, @EmbeddingModel, @Dimension,
+                        NULL, {embeddingExpr});
             """;
 
         await using var conn = db.CreateConnection();
-        await conn.ExecuteAsync(sql, new
+        await conn.ExecuteAsync(new CommandDefinition(sql, new
         {
             chunk.ChunkId,
             chunk.DocumentId,
             chunk.Version,
+            // 注意：此处仍硬编码 Zh —— DocumentChunk 尚无语言字段，属已知遗留
             Lang = (int)LanguageCode.Zh,
             chunk.PageNo,
-            BboxX = chunk.Bbox?.X, BboxY = chunk.Bbox?.Y, BboxW = chunk.Bbox?.Width, BboxH = chunk.Bbox?.Height,
+            BboxX = chunk.Bbox?.X,
+            BboxY = chunk.Bbox?.Y,
+            BboxW = chunk.Bbox?.Width,
+            BboxH = chunk.Bbox?.Height,
             chunk.Section,
             Text = chunk.Text,
             TableMarkdown = chunk.TableMarkdown,
             chunk.ImageRef,
             chunk.ImageDescription,
-            chunk.EmbeddingModel,
-            chunk.Dimension,
-            // 向量为空时写 NULL 而不是空字符串，便于区分「未生成向量」与「向量异常」
-            VectorJson = vector is { Length: > 0 } ? string.Join(',', vector) : null,
-        }, transaction: null, commandTimeout: 30).ConfigureAwait(false);
+            // embedding_model 与 dimension 跟随向量一起写：没有向量时留 NULL，
+            // 避免出现「记录了模型版本却没有向量」这种自相矛盾的状态（需求文档 FR10）
+            EmbeddingModel = hasVector ? _embeddingModel : null,
+            Dimension = hasVector ? _dimensions : (int?)null,
+            EmbeddingText = hasVector ? ToVectorLiteral(vector) : null,
+        }, commandTimeout: 30, cancellationToken: ct)).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<DocumentChunk>> KeywordSearchAsync(
@@ -86,6 +111,69 @@ public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
             .Take(topK)
             .Select(x => x.Chunk)
             .ToList();
+    }
+
+    /// <summary>
+    /// 向量检索：SQL Server 2025 原生 VECTOR_DISTANCE 余弦距离。
+    /// 未建向量索引时是暴力扫描 + 排序，对万级 chunk 足够；数据量上去后再评估向量索引。
+    /// </summary>
+    public async Task<IReadOnlyList<DocumentChunk>> VectorSearchAsync(
+        float[] queryVector, int topK, string? documentId, string? version, LanguageCode? language, CancellationToken ct = default)
+    {
+        if (topK <= 0 || queryVector.Length == 0) return Array.Empty<DocumentChunk>();
+        if (queryVector.Length != _dimensions)
+        {
+            throw new InvalidOperationException(
+                $"查询向量维度 {queryVector.Length} 与配置 Ai:EmbeddingDimensions = {_dimensions} 不一致。");
+        }
+
+        var filter = BuildFilter(documentId, version, language);
+        var sql = $"SELECT TOP (@TopK) {Columns("c")} {filter} AND c.embedding IS NOT NULL "
+                  + $"ORDER BY VECTOR_DISTANCE('cosine', c.embedding, CAST(@QueryVector AS VECTOR({_dimensions})));";
+
+        var args = BuildFilterArgs(documentId, version, language);
+        args.Add("TopK", topK);
+        args.Add("QueryVector", ToVectorLiteral(queryVector));
+
+        await using var conn = db.CreateConnection();
+        var rows = await conn.QueryAsync<ChunkRow>(
+            new CommandDefinition(sql, args, cancellationToken: ct)).ConfigureAwait(false);
+
+        return rows.Select(r => r.ToDomain()).ToList();
+    }
+
+    public async Task<DocumentChunk?> GetChunkAsync(string chunkId, CancellationToken ct = default)
+    {
+        await using var conn = db.CreateConnection();
+        var row = await conn.QuerySingleOrDefaultAsync<ChunkRow>(
+            new CommandDefinition(
+                $"SELECT {Columns("c")} FROM dbo.chunk c WHERE c.chunk_id = @ChunkId;",
+                new { ChunkId = chunkId },
+                cancellationToken: ct)).ConfigureAwait(false);
+        return row?.ToDomain();
+    }
+
+    /// <summary>
+    /// 检索结果需要的列，显式列出而不 SELECT *：
+    /// VECTOR 列映射到实体没有意义，也可能在读取时触发类型转换异常。
+    /// </summary>
+    private static string Columns(string alias) => string.Join(", ", new[]
+    {
+        "chunk_id", "document_id", "version", "[language]", "page_no",
+        "bbox_x", "bbox_y", "bbox_w", "bbox_h", "section", "[text]",
+        "table_markdown", "image_ref", "image_description", "embedding_model", "dimension",
+    }.Select(c => $"{alias}.{c}"));
+
+    /// <summary>把 float[] 转成 SQL Server VECTOR 接受的字面量，如 [0.1,0.2,0.3]。</summary>
+    private static string ToVectorLiteral(float[] vector)
+    {
+        var sb = new StringBuilder(vector.Length * 12).Append('[');
+        for (var i = 0; i < vector.Length; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(vector[i].ToString("R", CultureInfo.InvariantCulture));
+        }
+        return sb.Append(']').ToString();
     }
 
     /// <summary>
@@ -174,7 +262,7 @@ public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
         for (var i = 0; i < terms.Count; i++)
             likes.Add($"c.[text] LIKE @Like{i}");
 
-        var sql = $"SELECT TOP (@CandidateLimit) c.* {filter} AND ({string.Join(" OR ", likes)})";
+        var sql = $"SELECT TOP (@CandidateLimit) {Columns("c")} {filter} AND ({string.Join(" OR ", likes)})";
 
         var args = BuildFilterArgs(documentId, version, language);
         for (var i = 0; i < terms.Count; i++)
@@ -191,22 +279,6 @@ public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
     private static string EscapeLike(string value) =>
         value.Replace("[", "[[]").Replace("%", "[%]").Replace("_", "[_]");
 
-    /// <summary>
-    /// 向量检索尚未实现：接入 IEmbeddingProvider 后按余弦相似度实现。
-    /// 此处返回空集，而不是拿关键词结果冒充向量结果——避免上层误判「向量路已经可用」。
-    /// </summary>
-    public Task<IReadOnlyList<DocumentChunk>> VectorSearchAsync(
-        float[] queryVector, int topK, string? documentId, string? version, LanguageCode? language, CancellationToken ct = default)
-        => Task.FromResult<IReadOnlyList<DocumentChunk>>(Array.Empty<DocumentChunk>());
-
-    public async Task<DocumentChunk?> GetChunkAsync(string chunkId, CancellationToken ct = default)
-    {
-        await using var conn = db.CreateConnection();
-        var row = await conn.QuerySingleOrDefaultAsync<ChunkRow>(
-            "SELECT * FROM dbo.chunk WHERE chunk_id=@ChunkId;", new { ChunkId = chunkId }).ConfigureAwait(false);
-        return row?.ToDomain();
-    }
-
     /// <summary>语料统计的查询结果（df 列表以逗号拼接，避免动态行）。</summary>
     private sealed class CorpusStatsRow
     {
@@ -215,8 +287,7 @@ public sealed class SqlServerChunkStore(DbConfig db) : IVectorStore
         public string? DfList { get; set; }
     }
 
-    // SQL 行映射（用属性映射而非位置记录：可空列 + SELECT * 的额外列
-    // 会让位置记录的严格构造签名匹配失败，Dapper 直接抛异常）
+    // SQL 行映射（用属性映射而非位置记录：可空列 + 额外列会让位置记录的严格构造签名匹配失败）
     private sealed class ChunkRow
     {
         public string Chunk_id { get; set; } = string.Empty;

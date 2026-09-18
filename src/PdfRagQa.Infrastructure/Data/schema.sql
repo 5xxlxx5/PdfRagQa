@@ -90,7 +90,8 @@ BEGIN
         image_description    NVARCHAR(MAX) NULL,
         embedding_model      NVARCHAR(128) NULL,
         dimension            INT           NULL,
-        vector_json          NVARCHAR(MAX) NULL,       -- 向量占位(JSON)，后续由独立向量库/Milvus 承载
+        vector_json          NVARCHAR(MAX) NULL,       -- 已废弃：向量改存 embedding 列，保留仅为兼容历史数据
+        embedding            VECTOR(1024)  NULL,       -- SQL Server 2025 原生向量列
         created_at           DATETIME2     NOT NULL DEFAULT SYSDATETIME(),
         CONSTRAINT PK_chunk PRIMARY KEY (chunk_id)
     );
@@ -98,6 +99,17 @@ BEGIN
     CREATE INDEX IX_chunk_doc ON dbo.chunk (document_id, version, page_no);
     CREATE INDEX IX_chunk_lang ON dbo.chunk ([language]);
 END
+GO
+
+-- 原生向量列：SQL Server 2025 起支持 VECTOR 类型与 VECTOR_DISTANCE 函数，
+-- 因此不必引入 Milvus / Qdrant 等独立向量库，对工业内网离线部署是重要简化。
+--
+-- 维度必须与配置项 Ai:EmbeddingDimensions 一致，否则向量检索不可用；
+-- 该一致性由 DatabaseInitializer 在启动时校验并直接报错（需求文档 FR10：换 embedding 模型必须重建索引）。
+-- 若要改用其他维度的模型：ALTER 本列 → 清空 embedding → 重新导入全部文档。
+IF COL_LENGTH(N'dbo.chunk', N'embedding') IS NULL
+    ALTER TABLE dbo.chunk ADD embedding VECTOR(1024) NULL;
+GO
 GO
 
 -- qa_feedback：用户点赞/点踩/人工修正（FR9 反馈闭环）
