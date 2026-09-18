@@ -12,7 +12,7 @@ public sealed class DocumentsController(DocumentIngestionService ingestionServic
     [HttpPost("import")]
     public async Task<IActionResult> Import([FromBody] ImportDocumentRequest request, CancellationToken ct)
     {
-        var result = await ingestionService.ImportAsync(request, layout: (_, _) => null, ct);
+        var result = await ingestionService.ImportAsync(request, ct);
         return Ok(result);
     }
 }

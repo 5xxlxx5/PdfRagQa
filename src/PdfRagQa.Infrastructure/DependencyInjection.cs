@@ -8,6 +8,7 @@ using PdfRagQa.Infrastructure.LLM;
 using PdfRagQa.Infrastructure.Pdf;
 using PdfRagQa.Infrastructure.Retrieval;
 using PdfRagQa.Infrastructure.Storage;
+using PdfRagQa.Infrastructure.Vision;
 
 namespace PdfRagQa.Infrastructure;
 
@@ -22,14 +23,28 @@ public static class DependencyInjection
         services.AddSingleton(new DbConfig(connectionString));
         services.AddSingleton<DatabaseInitializer>();
 
+        // AI 服务配置（视觉模型走 OpenAI 兼容协议，可指向内网私有化部署）
+        var aiOptions = new AiOptions
+        {
+            BaseUrl = configuration[$"{AiOptions.SectionName}:BaseUrl"] ?? string.Empty,
+            ApiKey = configuration[$"{AiOptions.SectionName}:ApiKey"] ?? string.Empty,
+            VisionModel = configuration[$"{AiOptions.SectionName}:VisionModel"] ?? string.Empty,
+            RenderDpi = int.TryParse(configuration[$"{AiOptions.SectionName}:RenderDpi"], out var dpi) ? dpi : 120,
+            VisionTimeoutSeconds = int.TryParse(configuration[$"{AiOptions.SectionName}:VisionTimeoutSeconds"], out var timeout) ? timeout : 180,
+        };
+        services.AddSingleton(aiOptions);
+
         // 领域端口 -> SQL Server 实现（持久化）
         services.AddSingleton<IDocumentRepository, SqlServerDocumentRepository>();
         services.AddSingleton<IVectorStore, SqlServerChunkStore>();
         services.AddSingleton<IFeedbackRepository, SqlServerFeedbackRepository>();
 
-        // 领域端口 -> 基础设施实现（占位）
-        services.AddSingleton<IPdfParser, PlaceholderPdfParser>();
-        services.AddSingleton<IDocumentClassifier, HeuristicDocumentClassifier>();
+        // 领域端口 -> 基础设施实现
+        // 解析链路：手册走文本抽取，宣传册走「渲染 + 视觉识别」
+        services.AddSingleton<IPdfTextExtractor, PdfPigTextExtractor>();
+        services.AddSingleton<IPdfPageRenderer, PdfiumPageRenderer>();
+        services.AddSingleton<IVisionExtractor, OpenAiCompatibleVisionExtractor>();
+
         services.AddSingleton<ILlmClient, StubLlmClient>();
         services.AddSingleton<ICitationBuilder, CitationBuilder>();
 
