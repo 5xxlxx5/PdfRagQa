@@ -87,6 +87,13 @@ else
       >"$TMP_DIR/build.log" 2>&1; then
     fail "构建失败"
     tail -n 20 "$TMP_DIR/build.log"
+    if grep -q 'being used by another process\|正在被另一进程使用\|被.*锁定' "$TMP_DIR/build.log"; then
+      printf '\n  提示：有旧的服务实例仍占用输出目录的 DLL。\n'
+      printf '        先停掉它再重试，例如（PowerShell）：\n'
+      printf '        Get-CimInstance Win32_Process -Filter "Name='"'"'dotnet.exe'"'"'" |\n'
+      printf '          Where-Object { $_.CommandLine -like '"'"'*PdfRagQa*'"'"' } |\n'
+      printf '          ForEach-Object { Stop-Process -Id $_.ProcessId -Force }\n'
+    fi
     exit 1
   fi
 
